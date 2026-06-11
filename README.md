@@ -1,379 +1,407 @@
-# Armbian Kernel for Alpine Linux — Orange Pi PC
+# Alpine Linux Diskless + WireGuard + Kernel Armbian
 
-## Why Alpine Linux instead of Armbian?
+## Visão Geral
 
-Armbian is an excellent project, but it ships a full Debian/Ubuntu-based system
-that can feel heavy for a board with only 1GB of RAM. Alpine Linux offers a
-compelling alternative:
+Solução de VPN mesh de baixo custo para interligar redes remotas atrás de CGNAT,
+usando Alpine Linux em modo diskless em hardware ARM de baixo consumo.
 
-|                   | Alpine Linux                         | Armbian (Debian/Ubuntu)    |
-| ----------------- | ------------------------------------ | -------------------------- |
-| Base image size   | ~50MB                                | ~500MB+                    |
-| RAM usage at idle | ~30MB                                | ~150MB+                    |
-| Boot time         | ~5s                                  | ~20s+                      |
-| Package manager   | `apk` (fast, minimal)                | `apt` (heavier)            |
-| Init system       | OpenRC (simple)                      | systemd (complex)          |
-| Security          | musl libc, hardened by default       | glibc standard             |
-| Docker support    | Native, first-class                  | Available                  |
-| Customization     | Minimal base, add only what you need | Full desktop-oriented base |
+### Hardware recomendado
 
-Alpine Linux is ideal for **headless servers, Docker hosts, and lightweight
-services** — exactly what most people use a single-board computer for.
-The only downside is the limited hardware support in the default `armhf` kernel,
-which is exactly what this project solves by using the Armbian kernel.
+| Dispositivo | CPU | RAM | Cartão |
+|---|---|---|---|
+| Orange Pi PC | Allwinner H3 (armv7) | 512MB | 2GB+ |
+| Orange Pi Zero | Allwinner H2 (armv7) | 256MB | 2GB |
 
-**Best of both worlds:** Alpine's lightweight userspace with Armbian's
-fully-featured kernel.
+Custo aproximado: R$ 50-100 por unidade.
 
 ---
 
-## Why use the Armbian kernel?
+## Por que esta solução?
 
-The default Alpine Linux `armhf` kernel lacks several critical drivers for
-Allwinner H3/H2+ SoCs used on the Orange Pi PC and similar boards:
-
-| Feature                      | Alpine kernel | Armbian kernel |
-| ---------------------------- | ------------- | -------------- |
-| CPU thermal sensor           | ❌             | ✅              |
-| HDMI output                  | ❌             | ✅              |
-| Sunxi Cedrus video decoder   | ❌             | ✅              |
-| Full H3/H2+ hardware support | ❌             | ✅              |
-
-Rather than maintaining a custom kernel build, the most practical solution is
-to extract the `current-sunxi` kernel directly from an Armbian image — it is
-actively maintained, regularly updated, and fully supports the hardware out
-of the box.
+- Funciona atrás de CGNAT sem IP fixo no local remoto
+- Não precisa de acesso ao roteador principal da rede
+- Alpine diskless é resistente a quedas de energia (root em RAM)
+- Um único IP fixo centraliza o acesso a múltiplos locais
+- Hardware de R$50-100 substitui equipamentos proprietários caros
 
 ---
 
-## Compatibility
+## Arquitetura
 
-> **Tested on:** Orange Pi PC (Allwinner H3)
+```
+IP Fixo (MikroTik ou VPS)
+WireGuard Server
+              |
+    +---------+---------+---------+
+    |         |         |         |
+Alpine 1   Alpine 2   Alpine 3   Alpine N
+10.10.10.2 10.10.10.3 10.10.10.4 10.10.10.X
+192.168.3  192.168.5  192.168.X  192.168.X
+(CGNAT)    (CGNAT)    (CGNAT)    (CGNAT)
+```
 
-This project was developed and tested on the **Orange Pi PC**, and a ready-to-use
-Alpine base image is provided for it. However, the scripts are **board-agnostic**
-by design:
-
-- `extract-armbian.sh` works with any Armbian `.img.xz` image regardless of board
-- `install.sh` installs via SSH on any Alpine Linux system regardless of board
-
-This means the scripts should work on **any ARMv7 board supported by Armbian**,
-as long as:
-
-1. Alpine Linux is already installed and running on the board (even with the original Alpine kernel)
-2. The correct Armbian image for that board is used for extraction
-3. SSH access is available
-
-**Boards likely to work** (not tested — community feedback welcome):
-
-| Board            | SoC           | Armbian image to use         |
-| ---------------- | ------------- | ---------------------------- |
-| Orange Pi One    | Allwinner H3  | `Armbian_*_Orangepipc_*`     |
-| Orange Pi Lite   | Allwinner H3  | `Armbian_*_Orangepilite_*`   |
-| Orange Pi Zero   | Allwinner H2+ | `Armbian_*_Orangepizero_*`   |
-| NanoPi M1        | Allwinner H3  | `Armbian_*_NanoPiM1_*`       |
-| NanoPi NEO       | Allwinner H3  | `Armbian_*_NanoPiNeo_*`      |
-| BananaPi M2 Plus | Allwinner H3  | `Armbian_*_BananaPiM2Plus_*` |
-
-> If you test on a different board, please open an issue or PR with your results!
+Cada Alpine é instalado na rede local do cliente e conecta de volta ao MikroTik
+central via WireGuard. Por redirecionamento de porta, qualquer dispositivo de
+qualquer rede remota fica acessível através do Alpine local.
 
 ---
 
-## Overview
+## Topologia de Exemplo
 
-This folder contains two scripts:
+```
+Rede Principal:
+MikroTik (IP Público / DDNS)
+LAN: 192.168.10.0/24
 
-- **`extract-armbian.sh`** — Extracts kernel, DTBs, modules and U-Boot from an Armbian `.img.xz` image
-- **`install.sh`** — Installs the extracted files on Alpine Linux via SSH
+Alpine 1 (site A):
+VPN: 10.10.10.2
+LAN: 192.168.3.0/24 (atrás de CGNAT)
 
----
-
-## Requirements
-
-### PC (Linux)
-
-- `xz` — to decompress the Armbian image
-- `losetup` — to mount the image (usually pre-installed)
-- `rsync` — to copy files efficiently
-- `sudo` — required for losetup and dd
-
-### Target board
-
-- Alpine Linux installed and running (any kernel)
-- SSH access
-- `rsync` installed:
-  
-  ```sh
-  apk add rsync
-  ```
+Alpine 2 (site B):
+VPN: 10.10.10.3
+LAN: 192.168.5.0/24 (atrás de CGNAT)
+```
 
 ---
 
-## Base SD Card Image (Orange Pi PC only)
+## Como o Diskless Funciona
 
-A ready-to-use 2GB Alpine Linux base image is provided for the Orange Pi PC.
-It includes the base system pre-configured and ready to receive the Armbian kernel.
+```
+U-Boot -> extlinux.conf -> kernel + initramfs
+                               |
+                    monta modloop (squashfs, RO) em /.modloop
+                    /lib/modules -> /.modloop (symlink)
+                    root montado em tmpfs (RAM)
+                    apkovl carregado de /media/mmcblk0p1/
+                               |
+                    sistema pronto em RAM
+```
 
-For other boards, install Alpine Linux manually following the
-[Alpine Linux ARM installation guide](https://wiki.alpinelinux.org/wiki/Alpine_Linux_on_ARM)
-and then use `install.sh` to apply the Armbian kernel.
-
-### Flashing the base image
-
-**Linux:**
+Alterações sobrevivem ao reboot apenas se salvas com:
 
 ```sh
-gunzip -c alpine-orangepi-base.img.gz | sudo dd of=/dev/sdX bs=4M status=progress
+lbu commit -d
+```
+
+O estado é salvo em: `/media/mmcblk0p1/hostname.apkovl.tar.gz`
+
+---
+
+## Preparação do Cartão SD
+
+### 1. Gravar a imagem Alpine no cartão
+
+```sh
+# No PC
+dd if=alpine-uboot-3.23.4-armv7.img of=/dev/sdX bs=4M status=progress
 sync
 ```
 
-**Windows/Mac:** Use balenaEtcher.
+A imagem inclui U-Boot para Orange Pi PC e Zero em:
+- `/media/mmcblk0p1/u-boot/orangepi_pc/u-boot-sunxi-with-spl.bin`
+- `/media/mmcblk0p1/u-boot/orangepi_zero/u-boot-sunxi-with-spl.bin`
 
-> Replace `/dev/sdX` with your SD card device.
+### 2. Primeiro boot — setup-alpine
 
-### ⚠️ Expanding the root partition
-
-The base image is 2GB. If your SD card is larger, **you must expand the root
-partition manually** before booting, otherwise the extra space will be unused.
-
-**On Linux PC, using parted (recommended):**
-
-```sh
-sudo parted /dev/sdX resizepart 3 100%
-sudo e2fsck -f /dev/sdX3
-sudo resize2fs /dev/sdX3
+```
+Which disk(s) would you like to use? [none]: none
 ```
 
-**Or using fdisk:**
+Responder `none` — o sistema já está no cartão, não formatar nada.
+Configurar: hostname, rede, timezone, senha root, SSH.
+
+---
+
+## Script de Instalação do Kernel Armbian
+
+O script `install.sh` automatiza toda a configuração.
+
+### Uso
 
 ```sh
-sudo fdisk /dev/sdX
-# Delete partition 3 and recreate using all available space:
-# d → 3
-# n → p → 3 → <accept default start> → <accept default end>
-# w
+./install.sh <ip-do-orange-pi>
 ```
 
-Then resize the filesystem after first boot on the board:
+### Estrutura de arquivos necessária
+
+```
+./
+├── install.sh
+├── output/
+│   ├── vmlinuz-6.18.24-current-sunxi
+│   ├── dtbs/
+│   └── lib/modules/6.18.24-current-sunxi/
+└── u-boot/
+    └── u-boot-armbian.bin
+```
+
+### O que o script faz
+
+1. Copia kernel, U-Boot e DTBs para a partição boot
+2. Copia módulos do Armbian para o tmpfs
+3. Gera o modloop (squashfs com os módulos)
+4. Gera o initramfs com suporte a overlayfs/squashfs
+5. Restaura o symlink `/lib/modules -> /.modloop`
+6. Atualiza o `extlinux.conf`
+7. Configura carregamento de módulos extras via `local.d`
+8. Configura `lbu`, `fstab` e cache do apk
+9. Salva o estado com `lbu commit -d`
+10. Grava o U-Boot do Armbian
+
+### Observações importantes
+
+- O `mkinitfs` deve rodar ANTES de restaurar o symlink `/lib/modules`
+- O modloop é gerado com `mksquashfs` a partir dos módulos no tmpfs
+- O `lbu commit -d` persiste toda a configuração antes do reboot
+- Pacotes instalados após o script precisam de `lbu commit -d` para persistir
+
+---
+
+## Módulos Extras
+
+O módulo `sun8i_thermal` (sensor de temperatura do H3/H2) não carrega automaticamente.
+O script cria `/etc/local.d/modules.start`:
 
 ```sh
-resize2fs /dev/mmcblk0p3
+#!/bin/sh
+ln -sf /.modloop /lib/modules
+modprobe sun8i_thermal
+```
+
+Verificar o sensor:
+
+```sh
+cat /sys/class/thermal/thermal_zone0/temp
 ```
 
 ---
 
-## First Access and SSH Setup
-
-Before running `install.sh`, SSH access to the board must be working from your PC.
-
-### Using the provided base image
-
-The base image allows **passwordless root SSH login** out of the box — no setup
-needed. Simply connect the board to the network, find the IP and connect:
+## Persistência de Pacotes APK
 
 ```sh
-ssh root@<board-ip>
-```
-
-> **Security note:** Set a root password as soon as possible after installation:
-> 
-> ```sh
-> passwd root
-> ```
-
-### Using your own Alpine installation
-
-If you installed Alpine yourself, make sure SSH is running and accessible:
-
-```sh
-# On the board
-rc-update add sshd
-rc-service sshd start
-```
-
-If your Alpine install requires a password for SSH, copy your public key from
-the PC to avoid being prompted during the install script:
-
-```sh
-# On the PC — generate a key pair if you don't have one yet
-ssh-keygen -t ed25519
-
-# Copy the public key to the board
-ssh-copy-id root@<board-ip>
+setup-apkcache /media/mmcblk0p1/cache
+apk add <pacote>
+lbu commit -d
 ```
 
 ---
 
-## Step by Step
+## Configuração do WireGuard
 
-### 1. Download the Armbian image for your board
-
-Get the latest `current` image from:
-
-```
-https://www.armbian.com/download/
-```
-
-Download the `.img.xz` file for your board, for example:
-
-```
-Armbian_24.11_Orangepipc_bookworm_current_6.12.8.img.xz
-```
-
-### 2. Extract files from the Armbian image
+### Instalar
 
 ```sh
-chmod +x extract-armbian.sh
-./extract-armbian.sh Armbian_24.11_Orangepipc_bookworm_current_6.12.8.img.xz
+apk add wireguard-tools
+lbu commit -d
 ```
 
-Example output:
-
-```
-==> Decompressing image...
-==> Setting up loop device... /dev/loop0
-==> Partitions found: /dev/loop0p1
-==> Kernel version detected: 6.12.8-current-sunxi
-==> Extracting kernel...
-==> Extracting DTBs...
-==> Extracting modules...
-==> Extracting U-Boot...
-==> Updating KERNEL_VERSION in install.sh...
-==> Cleaning up temporary image...
-
-==> Extraction complete!
-    Kernel:  output/vmlinuz-6.12.8-current-sunxi
-    DTBs:    output/dtbs/
-    Modules: output/lib/modules/6.12.8-current-sunxi/
-    U-Boot:  u-boot/u-boot-armbian.bin
-
-    install.sh updated with KERNEL_VERSION=6.12.8-current-sunxi
-    Run: ./install.sh <board-ip>
-```
-
-### 3. Flash and expand the base image (Orange Pi PC only)
+### Gerar chaves
 
 ```sh
-# Flash the base image
-gunzip -c alpine-orangepi-base.img.gz | sudo dd of=/dev/sdX bs=4M status=progress
-sync
-
-# Expand root partition (if SD card > 2GB)
-sudo parted /dev/sdX resizepart 3 100%
-sudo e2fsck -f /dev/sdX3
-sudo resize2fs /dev/sdX3
+mkdir -p /etc/wireguard
+chmod 700 /etc/wireguard
+wg genkey | tee /etc/wireguard/private.key
+cat /etc/wireguard/private.key | wg pubkey | tee /etc/wireguard/public.key
 ```
 
-For other boards: install Alpine manually and proceed to step 4.
+### /etc/wireguard/wg0.conf
 
-### 4. Boot the board and connect via SSH
+```ini
+[Interface]
+PrivateKey = CHAVE_PRIVADA_ALPINE
+Address = 10.10.10.2/24
+PostUp = /etc/wireguard/firewall.start
+PreDown = /etc/wireguard/firewall.stop
 
-Insert the SD card, connect network cable and power on.
-Find the IP on your router or via serial connection.
+[Peer]
+PublicKey = CHAVE_PUBLICA_MIKROTIK
+Endpoint = seu-ddns.exemplo.com:13231
+AllowedIPs = 192.168.10.0/24,10.10.10.1/32
+PersistentKeepalive = 25
+```
 
-### 5. Install the Armbian kernel
+Para acessar a rede local de outro Alpine, adicionar a rede dele nos AllowedIPs:
+
+```ini
+AllowedIPs = 192.168.10.0/24,10.10.10.1/32,192.168.3.0/24
+```
+
+### /etc/wireguard/firewall.start
 
 ```sh
-chmod +x install.sh
-./install.sh <board-ip>
+#!/bin/sh
+
+# MASQUERADE global — cobre todos os redirecionamentos
+iptables -t nat -A POSTROUTING -j MASQUERADE
+iptables -A FORWARD -j ACCEPT
+
+# Redirecionamentos de porta — adicionar conforme necessário
+# Exemplo: porta 8080 local -> 192.168.3.21:80
+iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 192.168.3.21:80
+
+# Exemplo: mesma porta
+iptables -t nat -A PREROUTING -p tcp --dport 8000 -j DNAT --to-destination 192.168.3.21
+
+# Mostra regras aplicadas (útil para debug)
+iptables -L -n -v
 ```
 
-The script will:
-
-1. Copy the kernel to `/boot/`
-2. Copy all DTBs to `/boot/dtbs-lts/`
-3. Copy modules to `/lib/modules/<kernel-version>/`
-4. Configure `mkinitfs` for Sunxi MMC support
-5. Generate the initramfs
-6. Update `extlinux.conf` with the new kernel
-7. Flash the Armbian U-Boot to the SD card
-
-### 6. Review extlinux.conf before rebooting
+### /etc/wireguard/firewall.stop
 
 ```sh
-ssh root@<board-ip> cat /boot/extlinux/extlinux.conf
+#!/bin/sh
+
+# Remover MASQUERADE e FORWARD
+iptables -t nat -D POSTROUTING -j MASQUERADE
+iptables -D FORWARD -j ACCEPT
+
+# Remover redirecionamentos
+iptables -t nat -D PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 192.168.3.21:80
+iptables -t nat -D PREROUTING -p tcp --dport 8000 -j DNAT --to-destination 192.168.3.21
 ```
-
-Expected output:
-
-```
-menu title Alpine Linux
-timeout 1
-
-label sunxi
-menu label Linux current-sunxi
-kernel /vmlinuz-6.12.8-current-sunxi
-initrd /initramfs-sunxi
-fdtdir /dtbs-lts
-append root=UUID=<uuid> modules=sd-mod,usb-storage,ext4 quiet rootfstype=ext4
-```
-
-### 7. Reboot
 
 ```sh
-ssh root@<board-ip> reboot
+chmod +x /etc/wireguard/firewall.start
+chmod +x /etc/wireguard/firewall.stop
+lbu commit -d
 ```
 
-### 8. Verify
+### Subir no boot via local.d
+
+O serviço `wg-quick` do OpenRC não funciona no Alpine diskless por dependência
+de `need net` não satisfeita. O `local.d` é a solução confiável:
 
 ```sh
-# Kernel version
+cat > /etc/local.d/wireguard.start << 'EOF'
+#!/bin/sh
+wg-quick up wg0
+EOF
+
+chmod +x /etc/local.d/wireguard.start
+lbu commit -d
+```
+
+### IP Forwarding
+
+```sh
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
+sysctl -p /etc/sysctl.d/99-wireguard.conf
+lbu commit -d
+```
+
+---
+
+## Configuração do MikroTik
+
+```routeros
+# Interface WireGuard
+/interface wireguard
+add name=wg0 listen-port=13231
+
+# Endereço
+/ip address
+add address=10.10.10.1/24 interface=wg0
+
+# Peer Alpine 1
+/interface wireguard peers
+add interface=wg0 \
+    public-key="CHAVE_PUBLICA_ALPINE1" \
+    allowed-address=10.10.10.2/32,192.168.3.0/24
+
+# Peer Alpine 2
+/interface wireguard peers
+add interface=wg0 \
+    public-key="CHAVE_PUBLICA_ALPINE2" \
+    allowed-address=10.10.10.3/32,192.168.5.0/24
+
+# Rotas para redes remotas
+/ip route
+add dst-address=192.168.3.0/24 gateway=10.10.10.2
+add dst-address=192.168.5.0/24 gateway=10.10.10.3
+
+# Firewall
+/ip firewall filter
+add chain=input protocol=udp dst-port=13231 action=accept comment="WireGuard"
+```
+
+---
+
+## Acesso Entre Sites
+
+Para que Alpine 2 enxergue a rede local do Alpine 1:
+
+**wg0.conf do Alpine 2** — adicionar rede do Alpine 1 nos AllowedIPs:
+```ini
+AllowedIPs = 192.168.10.0/24,10.10.10.1/32,192.168.3.0/24
+```
+
+**MikroTik** — adicionar rede do Alpine 1 no allowed-address do peer Alpine 2:
+```routeros
+/interface wireguard peers
+set [find public-key="CHAVE_PUBLICA_ALPINE2"] \
+    allowed-address=10.10.10.3/32,192.168.5.0/24,192.168.3.0/24
+```
+
+---
+
+## Redirecionamento de Portas
+
+O Alpine não precisa ser o gateway da rede local. Via DNAT, qualquer dispositivo
+da rede local acessa equipamentos de redes remotas através do Alpine:
+
+```
+Host 192.168.5.x : porta local
+        |
+   Alpine (DNAT)
+        |
+   wg0 (túnel VPN)
+        |
+   dispositivo remoto : porta destino
+```
+
+O `POSTROUTING -j MASQUERADE` sem especificar interface cobre todos os
+redirecionamentos de uma vez, independente de qual interface o pacote usa para sair.
+
+---
+
+## Verificação
+
+```sh
+# Kernel
 uname -r
-# Expected: 6.12.8-current-sunxi
 
-# CPU temperature
-awk '{printf "CPU Temp: %.1f°C\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp
+# Modo diskless confirmado
+mount | grep -E 'tmpfs|modloop'
+# esperado: tmpfs on / e /.modloop squashfs
 
-# HDMI
-dmesg | grep -iE "hdmi|drm" | grep -i "bound\|initialized"
+# WireGuard
+wg show
+
+# Regras de firewall
+iptables -t nat -L -n -v
+iptables -L FORWARD -n -v
+
+# Sensor de temperatura
+cat /sys/class/thermal/thermal_zone0/temp
+
+# Testar acesso a rede remota
+ping 10.10.10.2
+ping 192.168.3.21
 ```
 
 ---
 
-## Updating to a new Armbian kernel version
+## Referência Rápida
 
-When Armbian releases a new kernel, simply:
-
-```sh
-# Extract from new Armbian image
-./extract-armbian.sh Armbian_<new-version>_Orangepipc_current.img.xz
-
-# Reinstall on the board
-./install.sh <board-ip>
-```
-
-The `extract-armbian.sh` script automatically updates `KERNEL_VERSION` in
-`install.sh` — no manual editing needed.
-
----
-
-## Troubleshooting
-
-| Issue                           | Cause                       | Solution                                                                |
-| ------------------------------- | --------------------------- | ----------------------------------------------------------------------- |
-| Kernel not found at boot        | Wrong path in extlinux.conf | Check `kernel /vmlinuz-...` has no `/boot/` prefix                      |
-| No space left during install    | Root partition not expanded | Expand partition before first boot                                      |
-| `rsync: not found` on board     | Package not installed       | Run `apk add rsync`                                                     |
-| U-Boot not updated              | `dd` failed                 | Check `/dev/mmcblk0` exists and rerun install                           |
-| HDMI no signal                  | Cable not connected at boot | Connect HDMI before powering on                                         |
-| Temperature not available       | Wrong kernel                | Verify `uname -r` shows `current-sunxi`                                 |
-| Board not booting after install | Incompatible U-Boot         | Try without flashing U-Boot — comment out the `dd` line in `install.sh` |
-
----
-
-## Contributing
-
-If you test this on a board other than the Orange Pi PC, please open an issue
-or PR with:
-
-- Board name and SoC
-- Armbian image used
-- Whether it worked or what failed
-
-This will help build a tested compatibility list for the community.
-
----
-
-## License
-
-MIT License — feel free to use, modify and distribute.
+| Aspecto | Detalhe |
+|---|---|
+| Arquitetura | armv7 (Allwinner H2/H3) |
+| Alpine | 3.23.x |
+| Kernel | 6.18.24-current-sunxi (Armbian) |
+| Interface LAN | eth0 |
+| Partição boot | mmcblk0p1 (FAT32) |
+| Root | tmpfs (RAM) |
+| Módulos | /.modloop (squashfs, RO) |
+| Estado persistido | /media/mmcblk0p1/hostname.apkovl.tar.gz |
+| WireGuard porta | UDP 13231 |
+| Hardware mínimo | Orange Pi Zero — H2, 256MB RAM, cartão 2GB |
