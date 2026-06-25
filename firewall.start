@@ -1,0 +1,80 @@
+#!/bin/sh
+#
+# firewall.start — config robusta para nó VPN remoto
+# Chamado pelo PostUp do wg0.conf
+#
+# Filosofia: previsibilidade acima de tudo. Hardware remoto não permite
+# correção presencial, então cada regra é específica e idempotente.
+
+LAN_IF="eth0"
+WG_IF="wg0"
+
+# ---------------------------------------------------------------------------
+# Limpeza idempotente: garante estado conhecido mesmo se o PostUp rodar
+# duas vezes (ex: WireGuard reconectando sem cair completamente).
+# ---------------------------------------------------------------------------
+iptables -t nat -F PREROUTING
+iptables -t nat -F POSTROUTING
+iptables -t mangle -F FORWARD
+iptables -F FORWARD
+
+# ---------------------------------------------------------------------------
+# MSS clamping — evita fragmentação no túnel.
+# Previne o sintoma "conecta mas trava no meio" em transferências grandes.
+# DEVE vir antes das regras de FORWARD.
+# ---------------------------------------------------------------------------
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
+    -j TCPMSS --clamp-mss-to-pmtu
+
+# ---------------------------------------------------------------------------
+# NAT e forwarding base
+# ---------------------------------------------------------------------------
+iptables -t nat -A POSTROUTING -o $LAN_IF -j MASQUERADE
+iptables -A FORWARD -i $WG_IF -o $LAN_IF -j ACCEPT
+iptables -A FORWARD -i $LAN_IF -o $WG_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# ---------------------------------------------------------------------------
+# pforward [dest_ip] [protocol] [port_in] [port_out]
+# Encapsula DNAT + FORWARD + MASQUERADE para cada redirecionamento.
+# ---------------------------------------------------------------------------
+pforward() {
+    local dest=$1
+    local prot=$2
+    local pin=$3
+    local pout=$4
+    iptables -t nat -A PREROUTING -p $prot --dport $pin -j DNAT --to-destination $dest:$pout
+    iptables -A FORWARD -p $prot -d $dest --dport $pout -j ACCEPT
+    iptables -t nat -A POSTROUTING -d $dest -p $prot --dport $pout -j MASQUERADE
+}
+
+# ---------------------------------------------------------------------------
+# route_to [dest_ip] [gateway_vpn]
+# Adiciona rota para dispositivo em outra rede remota via peer VPN.
+# 'replace' é idempotente — não falha se a rota já existir.
+# ---------------------------------------------------------------------------
+route_to() {
+    local dest=$1
+    local gw=$2
+    ip route replace $dest via $gw
+}
+
+# ===========================================================================
+# CONFIGURAÇÃO DO SITE — editar conforme necessário
+# ===========================================================================
+
+# Exemplo: dispositivo Hikvision local
+pforward 192.168.3.21 tcp 8000 8000
+pforward 192.168.3.21 tcp 8080 80
+
+# Exemplo: acesso a dispositivo em outro site via VPN
+# route_to 192.168.3.21/32 10.10.10.2
+
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Confirmação visual no log do boot
+# ---------------------------------------------------------------------------
+echo "=== firewall.start aplicado ==="
+iptables -L FORWARD -n -v
+echo "=== NAT ==="
+iptables -t nat -L -n -v

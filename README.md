@@ -211,7 +211,6 @@ cat /etc/wireguard/private.key | wg pubkey | tee /etc/wireguard/public.key
 PrivateKey = CHAVE_PRIVADA_ALPINE
 Address = 10.10.10.2/24
 PostUp = /etc/wireguard/firewall.start
-PreDown = /etc/wireguard/firewall.stop
 
 [Peer]
 PublicKey = CHAVE_PUBLICA_MIKROTIK
@@ -228,37 +227,93 @@ AllowedIPs = 192.168.10.0/24,10.10.10.1/32,192.168.3.0/24
 
 ### /etc/wireguard/firewall.start
 
+O script começa com um flush (`-F`) das chains para garantir estado conhecido —
+idempotente mesmo se o PostUp rodar duas vezes numa reconexão. A função `pforward`
+encapsula as três regras de cada redirecionamento (DNAT + FORWARD + MASQUERADE).
+
 ```sh
 #!/bin/sh
 
-# MASQUERADE global — cobre todos os redirecionamentos
-iptables -t nat -A POSTROUTING -j MASQUERADE
-iptables -A FORWARD -j ACCEPT
+LAN_IF="eth0"
+WG_IF="wg0"
 
-# Redirecionamentos de porta — adicionar conforme necessário
-# Exemplo: porta 8080 local -> 192.168.3.21:80
-iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 192.168.3.21:80
+# Limpeza idempotente + base
+iptables -t nat -F PREROUTING
+iptables -t nat -F POSTROUTING
+iptables -t mangle -F FORWARD
+iptables -F FORWARD
 
-# Exemplo: mesma porta
-iptables -t nat -A PREROUTING -p tcp --dport 8000 -j DNAT --to-destination 192.168.3.21
+# MSS clamping — evita fragmentação no túnel (sintoma "conecta mas trava")
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# Mostra regras aplicadas (útil para debug)
-iptables -L -n -v
+# NAT e forwarding base
+iptables -t nat -A POSTROUTING -o $LAN_IF -j MASQUERADE
+iptables -A FORWARD -i $WG_IF -o $LAN_IF -j ACCEPT
+iptables -A FORWARD -i $LAN_IF -o $WG_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# pforward [dest_ip] [protocol] [port_in] [port_out]
+pforward() {
+    local dest=$1
+    local prot=$2
+    local pin=$3
+    local pout=$4
+    iptables -t nat -A PREROUTING -p $prot --dport $pin -j DNAT --to-destination $dest:$pout
+    iptables -A FORWARD -p $prot -d $dest --dport $pout -j ACCEPT
+    iptables -t nat -A POSTROUTING -d $dest -p $prot --dport $pout -j MASQUERADE
+}
+
+# === Configuração do site — editar conforme necessário ===
+pforward 192.168.3.21 tcp 8080 80
+ip route replace 192.168.3.21/32 via 10.10.10.2
+
+# Confirmação visual no log do boot
+echo "=== firewall.start aplicado ==="
+iptables -L FORWARD -n -v
+echo "=== NAT ==="
+iptables -t nat -L -n -v
 ```
+
+Pontos-chave de robustez para hardware remoto:
+
+- **Flush no início** — estado conhecido a cada execução, sem acúmulo de regras duplicadas
+- **MSS clamping antes do FORWARD** — a ordem importa; previne fragmentação
+- **`ip route replace`** — idempotente, nunca falha por rota duplicada
+- **`LAN_IF`/`WG_IF` no topo** — se a interface mudar de nome, corrige num lugar só
+- **Log no final** — permite diagnóstico remoto via log do boot, sem ir ao local
+
+Como o script faz flush das chains, ele assume que **só ele gerencia o iptables**.
+Se houver outras regras (fail2ban, proteção de SSH), elas seriam apagadas.
+
+> **Atenção:** a interface LAN no Alpine é `eth0`. Não confundir com `end0`
+> (nome usado por algumas distros/kernels) — usar o nome errado faz a regra
+> não casar com nenhum tráfego.
+
+Como o flush no início já garante estado limpo, o `firewall.stop` é opcional —
+o WireGuard ao descer remove a interface `wg0` e as regras associadas perdem efeito.
+Ainda assim, um `firewall.stop` explícito é útil para reset manual durante
+manutenção remota.
 
 ### /etc/wireguard/firewall.stop
 
 ```sh
 #!/bin/sh
-
-# Remover MASQUERADE e FORWARD
-iptables -t nat -D POSTROUTING -j MASQUERADE
-iptables -D FORWARD -j ACCEPT
-
-# Remover redirecionamentos
-iptables -t nat -D PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 192.168.3.21:80
-iptables -t nat -D PREROUTING -p tcp --dport 8000 -j DNAT --to-destination 192.168.3.21
+iptables -F
+iptables -t nat -F
+iptables -t mangle -F
+iptables -t raw -F
+iptables -X
+iptables -t nat -X
+iptables -t mangle -X
+iptables -t raw -X
+iptables -Z
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
 ```
+
+As policies `ACCEPT` no final garantem que, mesmo se alguma chain tiver sido
+deixada em `DROP`, o reset volta ao estado permissivo — evitando ficar trancado
+para fora de um equipamento remoto.
 
 ```sh
 chmod +x /etc/wireguard/firewall.start
