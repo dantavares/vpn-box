@@ -346,6 +346,42 @@ lbu commit -d
 
 ---
 
+## LED de Status do WireGuard
+
+O Orange Pi PC tem um LED vermelho (`orangepi:red:status`) que pode servir como
+indicador visual do túnel — útil para diagnóstico em campo sem precisar de SSH.
+
+Usando o trigger `netdev` do kernel, o LED pisca conforme tráfego na interface `wg0`.
+Como o `PersistentKeepalive = 25` gera um pacote a cada 25 segundos, o LED pisca
+nesse ritmo naturalmente:
+
+- **LED piscando** → túnel ativo (keepalive + tráfego)
+- **LED parado** → túnel caído
+
+Não precisa de script de monitoramento — o kernel cuida de tudo via trigger.
+
+### Carregar o módulo (em /etc/local.d/modules.start)
+
+```sh
+modprobe ledtrig-netdev
+```
+
+### Configurar o LED (no firewall.start, reaproveitando WG_IF)
+
+```sh
+LED=/sys/class/leds/orangepi:red:status
+echo netdev > $LED/trigger
+echo $WG_IF > $LED/device_name
+echo 1 > $LED/tx
+echo 1 > $LED/rx
+```
+
+Colocar o `modprobe` junto dos outros módulos e a config do LED no `firewall.start`
+mantém a coerência (cada coisa no seu lugar) e reaproveita a variável `WG_IF` —
+se o nome da interface mudar no futuro, corrige num lugar só.
+
+---
+
 ## Configuração do MikroTik
 
 ```routeros
@@ -416,6 +452,87 @@ Host 192.168.5.x : porta local
 
 O `POSTROUTING -j MASQUERADE` sem especificar interface cobre todos os
 redirecionamentos de uma vez, independente de qual interface o pacote usa para sair.
+
+---
+
+## Acesso Reverso: Internet → Dispositivo na Rede Remota
+
+Cenário inverso: expor um dispositivo que está atrás do Alpine (rede remota via VPN)
+para acesso direto pela internet, através do IP fixo do MikroTik.
+
+```
+Cliente na Internet
+        |
+   IP fixo do MikroTik : porta externa
+        |
+   dst-nat -> WG-Server (túnel VPN)
+        |
+   Alpine (rede 192.168.3.0/24)
+        |
+   dispositivo final : 192.168.3.84:80
+```
+
+### Configuração no MikroTik
+
+```routeros
+# 1. dst-nat: redireciona porta externa para o dispositivo via VPN
+/ip firewall nat
+add chain=dstnat action=dst-nat in-interface=WAN protocol=tcp \
+    dst-port=82 to-addresses=192.168.3.84 to-ports=80
+
+# 2. CRÍTICO: masquerade na saída pela interface WireGuard
+/ip firewall nat
+add chain=srcnat action=masquerade out-interface=WG-Server place-before=1
+```
+
+### Por que a regra de masquerade na VPN é necessária
+
+Sem o masquerade na interface WireGuard, o pacote chega no dispositivo final
+(`192.168.3.84`) com a origem do IP do cliente externo. O dispositivo tenta responder
+para esse IP, mas a resposta vai para o gateway padrão da rede local (roteador
+genérico), não para o Alpine — e a conexão nunca fecha. O ping funciona (ICMP é
+mais simples), mas TCP/HTTP travam.
+
+Com o masquerade na `WG-Server`, o MikroTik reescreve a origem para o próprio IP
+na VPN (ex: `172.16.1.1`). O dispositivo final responde para o Alpine, que devolve
+pela VPN ao MikroTik, fechando o caminho corretamente.
+
+### Detalhe importante: masquerade genérico vs específico
+
+```routeros
+# Genérico — mascara saída por TODAS as interfaces (funciona em qualquer cenário)
+chain=srcnat action=masquerade
+
+# Específico — mascara só saída pela WAN (precisa regra extra para a VPN)
+chain=srcnat action=masquerade out-interface=WAN
+```
+
+Se o MikroTik usa masquerade **genérico** (sem `out-interface`), o acesso reverso
+pela VPN funciona automaticamente — a regra abrangente já cobre a `WG-Server`.
+
+Se usa masquerade **específico por WAN**, é obrigatório adicionar a regra explícita
+de masquerade `out-interface=WG-Server`, senão o tráfego da VPN não é mascarado e
+o retorno quebra.
+
+> Confirmar o nome real da interface WireGuard no MikroTik antes de criar a regra:
+> `/interface wireguard print`. O nome pode não ser `wg0` (ex: `WG-Server`).
+
+### Checklist para novos deployments
+
+Se a sua prática padrão é usar masquerade **específico por WAN**
+(`out-interface=WAN`), lembre-se: **todo novo MikroTik que precisar de acesso
+reverso via VPN exige a regra explícita de masquerade na interface WireGuard.**
+
+```routeros
+/ip firewall nat add chain=srcnat action=masquerade out-interface=WG-Server place-before=1
+```
+
+Sem ela, o sintoma é traiçoeiro: o dispositivo responde ao ping (de dentro da LAN
+do MikroTik e da VPN), mas o acesso reverso pela internet trava no handshake TCP.
+É fácil culpar o equipamento — mas a causa é sempre a config. Um MikroTik com
+masquerade genérico (sem `out-interface`) mascara essa necessidade e funciona
+"por acidente"; ao padronizar para masquerade específico, a regra da VPN passa a
+ser obrigatória em cada site.
 
 ---
 
