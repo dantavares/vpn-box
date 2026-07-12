@@ -1,0 +1,14 @@
+[Interface]
+ListenPort = 51820
+PrivateKey =
+Address =
+
+# Nao apague estas duas linhas abaixo
+PostUp = /etc/wireguard/firewall.start
+PreDown = /etc/wireguard/firewall.stop
+
+[Peer]
+PublicKey =
+AllowedIPs =
+Endpoint =
+PersistentKeepalive = 30
