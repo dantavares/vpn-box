@@ -9,7 +9,7 @@ usando Alpine Linux em modo diskless em hardware ARM de baixo consumo.
 
 | Dispositivo | CPU | RAM | Cartão |
 |---|---|---|---|
-| Orange Pi PC | Allwinner H3 (armv7) | 1GB | 2GB+ |
+| Orange Pi PC | Allwinner H3 (armv7) | 512MB | 2GB+ |
 | Orange Pi Zero | Allwinner H2 (armv7) | 256MB | 2GB |
 
 Custo aproximado: R$ 50-100 por unidade.
@@ -210,6 +210,7 @@ cat /etc/wireguard/private.key | wg pubkey | tee /etc/wireguard/public.key
 [Interface]
 PrivateKey = CHAVE_PRIVADA_ALPINE
 Address = 10.10.10.2/24
+MTU = 1380
 PostUp = /etc/wireguard/firewall.start
 
 [Peer]
@@ -224,6 +225,70 @@ Para acessar a rede local de outro Alpine, adicionar a rede dele nos AllowedIPs:
 ```ini
 AllowedIPs = 192.168.10.0/24,10.10.10.1/32,192.168.3.0/24
 ```
+
+---
+
+## MTU e o Problema do Túnel via IPv6
+
+**Sintoma:** ping funciona normalmente através do túnel, mas conexões TCP
+(SSH, HTTP) travam ou nunca completam — especificamente quando o endpoint
+WireGuard conecta por **IPv6** em vez de IPv4. A mesma configuração de
+iptables funciona perfeitamente quando a conexão é por IPv4.
+
+### Causa
+
+O overhead de encapsulamento do WireGuard muda conforme o transporte externo:
+
+```
+Overhead IPv4 externo: ~60 bytes (20 IPv4 + 8 UDP + 32 WireGuard)
+Overhead IPv6 externo: ~80 bytes (40 IPv6 + 8 UDP + 32 WireGuard)
+```
+
+O cabeçalho IPv6 é 20 bytes maior que o IPv4. Um MTU calculado pensando em
+IPv4 (`1420`, o valor padrão comum) fica sem margem quando o túnel na
+prática viaja por IPv6 — pacotes grandes (handshake TCP, dados de sessão)
+ultrapassam o MTU real e precisam ser fragmentados.
+
+O IPv6 não permite fragmentação no meio do caminho (só na origem) — depende
+de ICMPv6 "Packet Too Big" para o PMTU Discovery funcionar. Se qualquer
+ponto do caminho bloquear ICMPv6 (comum em CGNAT IPv6), os pacotes grandes
+são descartados silenciosamente — o clássico "PMTUD black hole".
+
+Ping (ICMP) usa pacotes pequenos e não é afetado. SSH/TCP usa pacotes
+maiores durante o handshake e é onde o problema aparece.
+
+### Diagnóstico
+
+```sh
+# Ver o MTU atual do wg0
+ip link show wg0
+
+# Testar o path MTU real
+ping -M do -s 1400 <ip-do-peer-remoto>
+# Reduzir o -s até parar de falhar/fragmentar
+```
+
+### Solução
+
+Reduzir o MTU do WireGuard para ter margem mesmo no pior caso (IPv6):
+
+```ini
+MTU = 1380
+```
+
+```sh
+wg-quick down wg0
+wg-quick up wg0
+```
+
+### Impacto
+
+MTU menor gera ligeiramente mais pacotes para a mesma quantidade de dados
+(~3% de overhead adicional). Throughput e latência praticamente não são
+afetados no uso típico (gerenciamento remoto, câmeras, acesso administrativo).
+A troca vale a pena: um link "3% mais lento mas confiável" é sempre melhor
+que um link que trava aleatoriamente em conexões TCP — especialmente em
+hardware que não pode ser visitado fisicamente.
 
 ### /etc/wireguard/firewall.start
 
@@ -360,28 +425,6 @@ nesse ritmo naturalmente:
 
 Não precisa de script de monitoramento — o kernel cuida de tudo via trigger.
 
-## Nota sobre U-Boot e LED vermelho (boards H3)
-
-Ao portar a mesma imagem SD entre boards Orange Pi da família H3 (PC, One, etc.),
-o LED vermelho pode não funcionar mesmo com todo o resto operando normalmente
-(rede, USB, MMC, etc.).
-
-A causa é o U-Boot: cada board tem seu próprio defconfig (`orangepi_pc_defconfig`,
-`orangepi_one_defconfig`, etc.) e o pinmux inicial configurado pelo SPL persiste
-até o kernel assumir. Se o U-Boot não corresponde ao board físico, o pino do LED
-fica configurado de forma incompatível e o kernel não reverte esse estado.
-
-Solução: regravar o U-Boot correspondente ao board de destino diretamente no
-cartão que já está no dispositivo, sem precisar removê-lo:
-
-    dd if=/media/mmcblk0p1/u-boot-armbian.bin of=/dev/mmcblk0 bs=8k seek=1
-
-Onde `u-boot-armbian.bin` deve ter sido compilado para o board de destino
-(One, PC, Lite, etc.), não o de origem.
-
-Observado empiricamente: o LED é o único sintoma visível. Todos os outros
-periféricos funcionam normalmente mesmo com U-Boot "errado".
-
 ### Carregar o módulo (em /etc/local.d/modules.start)
 
 ```sh
@@ -404,244 +447,7 @@ se o nome da interface mudar no futuro, corrige num lugar só.
 
 ---
 
-## Habilitando o Wifi XR819 no Orange Pi Zero
-
-O Orange Pi Zero tem wifi onboard (chip Allwinner XR819), mas o driver `xradio_wlan`
-tem histórico de instabilidade e a documentação da comunidade em geral trata o chip
-como inviável. Empiricamente, **funciona** no kernel Armbian current (6.18.x) com o
-driver in-tree, desde que firmware, regulatory database e policy routing estejam
-corretamente configurados.
-
-Esta seção documenta o setup para uso do Zero como nó VPN via wifi, quando cabo
-Ethernet não é viável.
-
-### Pré-requisitos
-
-- Armbian current rodando em outro Zero (fonte do driver + firmware)
-- Alpine diskless já validado no Zero de destino (base)
-- Ambos os sistemas no mesmo kernel (ex: `6.18.35-current-sunxi`)
-
-### Passo 1 — Extrair do Armbian
-
-No Armbian rodando, os arquivos necessários estão em:
-
-```
-/lib/modules/<versão>/kernel/drivers/net/wireless/xradio/xradio_wlan.ko
-/lib/firmware/xr819/boot_xr819.bin
-/lib/firmware/xr819/fw_xr819.bin
-/lib/firmware/xr819/sdd_xr819.bin
-/lib/firmware/regulatory.db
-/lib/firmware/regulatory.db.p7s
-```
-
-Copiar via `scp` para o Alpine (ex: em `/root/xradio/`).
-
-### Passo 2 — Injetar o módulo no modloop
-
-Como `/lib/modules` no Alpine é symlink para `/.modloop` (squashfs read-only),
-copiar o `.ko` diretamente ali não persiste. É preciso reempacotar o modloop com
-o módulo dentro.
-
-Devido às limitações de RAM do Zero (256MB), o `unsquashfs` + `mksquashfs` não roda
-localmente sem crashar. **Executar em um Orange Pi PC (1GB) ou em outro dispositivo
-com mais RAM, usando o mesmo cartão SD**:
-
-```sh
-# No dispositivo com RAM suficiente, com o cartão do Zero montado
-apk add squashfs-tools kmod
-
-# Backup do modloop atual
-cp /media/mmcblk0p1/boot/modloop-sunxi /media/mmcblk0p1/boot/modloop-sunxi.bak
-
-# Descompactar
-mkdir -p /tmp/modloop-rebuild
-cd /tmp/modloop-rebuild
-unsquashfs -d ./extracted /media/mmcblk0p1/boot/modloop-sunxi
-
-# Injetar xradio_wlan
-KERNEL_VER=$(ls ./extracted | grep -v firmware | head -1)
-XRADIO_DEST="./extracted/${KERNEL_VER}/kernel/drivers/net/wireless/xradio"
-mkdir -p "$XRADIO_DEST"
-cp /root/xradio/xradio_wlan.ko "$XRADIO_DEST/"
-
-# Regenerar dependências (o depmod precisa do layout /lib/modules/<versão>)
-mkdir -p ./depmod-root/lib/modules
-ln -s /tmp/modloop-rebuild/extracted/${KERNEL_VER} \
-      /tmp/modloop-rebuild/depmod-root/lib/modules/${KERNEL_VER}
-depmod -b ./depmod-root -a ${KERNEL_VER}
-
-# Reempacotar
-mksquashfs ./extracted /media/mmcblk0p1/boot/modloop-sunxi.new -comp xz -noappend
-mv /media/mmcblk0p1/boot/modloop-sunxi.new /media/mmcblk0p1/boot/modloop-sunxi
-```
-
-Depois voltar o cartão para o Zero.
-
-### Passo 3 — Instalar firmware via apkovl
-
-O firmware é lido de `/lib/firmware/` no boot. Como esse path é volátil (tmpfs),
-persiste via `lbu`:
-
-```sh
-# No Alpine (Zero)
-mkdir -p /lib/firmware/xr819
-cp /root/xradio/*.bin /lib/firmware/xr819/
-cp /root/xradio/regulatory.db /lib/firmware/
-cp /root/xradio/regulatory.db.p7s /lib/firmware/
-
-lbu add /lib/firmware/xr819
-lbu add /lib/firmware/regulatory.db
-lbu add /lib/firmware/regulatory.db.p7s
-lbu commit -d
-```
-
-Sem o `regulatory.db`, o mac80211 opera em "world regulatory domain" restritivo,
-o que na prática capa o TX bitrate em 1 Mbps e a conexão vira inutilizável.
-
-### Passo 4 — Carregar o módulo no boot
-
-Adicionar em `/etc/modules`:
-
-```sh
-echo "xradio_wlan" >> /etc/modules
-lbu add /etc/modules
-lbu commit -d
-```
-
-### Passo 5 — Configurar wpa_supplicant
-
-```sh
-apk add wpa_supplicant
-wpa_passphrase "SUA_REDE" "SUA_SENHA" > /etc/wpa_supplicant/wpa_supplicant.conf
-
-# Adicionar ctrl_interface para o wpa_cli funcionar
-sed -i '1i ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n' \
-    /etc/wpa_supplicant/wpa_supplicant.conf
-
-# Especificar interface explicitamente (autodetect falha por race condition no boot)
-cat > /etc/conf.d/wpa_supplicant << 'EOF'
-wpa_supplicant_args=""
-wpa_supplicant_if="wlan0"
-EOF
-```
-
-Adicionar `auto wlan0` em `/etc/network/interfaces`:
-
-```
-auto wlan0
-iface wlan0 inet dhcp
-```
-
-### Passo 6 — Policy routing (coexistência com eth0)
-
-Se o Zero também tem Ethernet ligado (setup misto), eth0 e wlan0 podem cair na
-mesma subnet. O kernel escolhe a rota de menor métrica (eth0), e o tráfego
-originado pelo wlan0 sofre reverse path filter — associação funciona, ARP
-responde, mas ICMP e TCP são descartados silenciosamente.
-
-Solução: tabela de rotas dedicada + rule pelo IP de origem, aplicada
-dinamicamente via hook `if-up.d`:
-
-```sh
-mkdir -p /etc/network/if-up.d
-cat > /etc/network/if-up.d/wlan0-policy-route << 'SCRIPT'
-#!/bin/sh
-[ "$IFACE" = "wlan0" ] || exit 0
-
-CIDR=$(ip -4 addr show wlan0 | awk '/inet / {print $2}' | head -1)
-[ -z "$CIDR" ] && exit 0
-
-WLAN_IP=$(echo "$CIDR" | cut -d/ -f1)
-WLAN_NET=$(ip -4 route show dev wlan0 | awk '/proto kernel/ {print $1}' | head -1)
-GATEWAY=$(ip -4 route show dev wlan0 | awk '/default/ {print $3}' | head -1)
-
-[ -z "$WLAN_NET" ] && exit 0
-[ -z "$GATEWAY" ] && exit 0
-
-ip route flush table 200 2>/dev/null
-ip rule del table 200 2>/dev/null || true
-
-ip route add "$WLAN_NET" dev wlan0 src "$WLAN_IP" table 200
-ip route add default via "$GATEWAY" dev wlan0 table 200
-ip rule add from "$WLAN_IP" table 200
-
-logger -t wlan0-policy "Policy routing configured: src=$WLAN_IP net=$WLAN_NET gw=$GATEWAY"
-SCRIPT
-chmod +x /etc/network/if-up.d/wlan0-policy-route
-
-lbu add /etc/network/if-up.d/wlan0-policy-route
-lbu commit -d
-```
-
-### Passo 7 — Boot autônomo (workaround race condition)
-
-O driver xradio leva cerca de 40 segundos entre o `modprobe` retornar e o `wlan0`
-estar realmente operacional (carrega firmware via SDIO, enumera, faz auth+assoc).
-Nenhum serviço padrão do OpenRC espera por isso — o `wpa_supplicant` no runlevel
-`boot` tenta iniciar antes, falha com return code 255, respawna 5x, e desiste.
-Rearranjar runlevels não resolve.
-
-A solução é rodar em background via `local.d`, sem bloquear o boot:
-
-```sh
-cat > /etc/local.d/00-late-wlan0.start << 'EOF'
-#!/bin/sh
-(
-    for i in $(seq 1 60); do
-        if [ -d /sys/class/net/wlan0 ]; then
-            sleep 5   # margem pro driver estabilizar após criar a interface
-            break
-        fi
-        sleep 1
-    done
-
-    rc-service wpa_supplicant restart
-
-    for i in $(seq 1 30); do
-        wpa_cli -i wlan0 status 2>/dev/null | grep -q "wpa_state=COMPLETED" && break
-        sleep 1
-    done
-
-    ifup wlan0
-) &
-EOF
-chmod +x /etc/local.d/00-late-wlan0.start
-
-lbu add /etc/local.d/00-late-wlan0.start
-lbu commit -d
-```
-
-O `local` já está no runlevel `default` por padrão. O `&` no fim garante que roda
-em background — o boot completa normalmente com eth0 (se presente) e o wlan0
-aparece alguns segundos depois, sem afetar nada.
-
-### Validação
-
-Após reboot (com ou sem cabo Ethernet):
-
-```sh
-lsmod | grep xradio             # xradio_wlan carregado
-ip addr show wlan0              # deve ter IP
-iw dev wlan0 link               # SSID + bitrate real
-ping -I wlan0 <gateway>         # tráfego funcional
-ip rule show                    # regra da tabela 200 presente
-```
-
-Descoberta via mDNS (`hostname.local`) funciona nativamente pelo Avahi já
-instalado por padrão no Alpine — útil para conectar sem saber o IP DHCP.
-
-### Observações
-
-- **Sem `regulatory.db`**: TX capado em 1 Mbps, conexão inutilizável mesmo associada.
-- **Sem policy routing**: coexistência com eth0 na mesma subnet quebra tráfego wlan0.
-- **Sem `00-late-wlan0.start`**: `wpa_supplicant` desiste antes do driver terminar de subir.
-- **XR819 é limitado**: throughput real fica na faixa de dezenas de Mbps mesmo em condições boas,
-  com retries frequentes em transmissão. Adequado para WireGuard (banda baixa, tolerante a
-  latência), inadequado para tráfego pesado.
-
----
-
-
+## Configuração do MikroTik
 
 ```routeros
 # Interface WireGuard
@@ -835,4 +641,5 @@ ping 192.168.3.21
 | Módulos | /.modloop (squashfs, RO) |
 | Estado persistido | /media/mmcblk0p1/hostname.apkovl.tar.gz |
 | WireGuard porta | UDP 13231 |
+| WireGuard MTU | 1380 (margem para túnel via IPv6) |
 | Hardware mínimo | Orange Pi Zero — H2, 256MB RAM, cartão 2GB |

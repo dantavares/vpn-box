@@ -2,8 +2,7 @@
 ListenPort = 51820
 PrivateKey =
 Address =
-
-# Nao apague estas duas linhas abaixo
+MTU = 1380
 PostUp = /etc/wireguard/firewall.start
 PreDown = /etc/wireguard/firewall.stop
 

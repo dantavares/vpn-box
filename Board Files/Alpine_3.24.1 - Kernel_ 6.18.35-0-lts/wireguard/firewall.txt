@@ -1,44 +1,62 @@
 #!/bin/sh
+. /etc/conf.d/leds
 
 #------------
 # Interfaces
 #-----------
+#LAN_IF="wlan0"
 LAN_IF="eth0"
 WG_IF="wg0"
-LED=/sys/class/leds/orangepi:red:status
 
 # --------------------------------------------------------------------------
-# Configuração geral de firewall
+# Criar chains próprias do WireGuard (idempotente — não falha se já existir)
 # --------------------------------------------------------------------------
-iptables -t nat -F PREROUTING
-iptables -t nat -F POSTROUTING
-iptables -t mangle -F FORWARD
-iptables -F FORWARD
-iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-iptables -t nat -A POSTROUTING -o $LAN_IF -j MASQUERADE
-iptables -A FORWARD -i $WG_IF -o $LAN_IF -j ACCEPT
-iptables -A FORWARD -i $LAN_IF -o $WG_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -t nat -N WG_PREROUTING 2>/dev/null
+iptables -t nat -N WG_POSTROUTING 2>/dev/null
+iptables -t mangle -N WG_MSS 2>/dev/null
+iptables -N WG_FORWARD 2>/dev/null
+
+# --------------------------------------------------------------------------
+# Limpar SÓ as chains próprias (não toca nas nativas nem em regras de outros scripts)
+# --------------------------------------------------------------------------
+iptables -t nat -F WG_PREROUTING
+iptables -t nat -F WG_POSTROUTING
+iptables -t mangle -F WG_MSS
+iptables -F WG_FORWARD
+
+# --------------------------------------------------------------------------
+# Garantir que as chains nativas apontam pra cá — só adiciona o jump se ainda não existir
+# --------------------------------------------------------------------------
+iptables -t nat -C PREROUTING -j WG_PREROUTING 2>/dev/null || iptables -t nat -A PREROUTING -j WG_PREROUTING
+iptables -t nat -C POSTROUTING -j WG_POSTROUTING 2>/dev/null || iptables -t nat -A POSTROUTING -j WG_POSTROUTING
+iptables -t mangle -C FORWARD -j WG_MSS 2>/dev/null || iptables -t mangle -A FORWARD -j WG_MSS
+iptables -C FORWARD -j WG_FORWARD 2>/dev/null || iptables -A FORWARD -j WG_FORWARD
+
+# --------------------------------------------------------------------------
+# Regras do WireGuard, dentro das chains próprias
+# --------------------------------------------------------------------------
+iptables -t mangle -A WG_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+iptables -t nat -A WG_POSTROUTING -o $LAN_IF -j MASQUERADE
+iptables -A WG_FORWARD -i $WG_IF -o $LAN_IF -j ACCEPT
+iptables -A WG_FORWARD -i $LAN_IF -o $WG_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # ---------------------------------------------------------------------------
 # pforward [dest_ip] [protocol] [port_in] [port_out]
-# Encapsula DNAT + FORWARD + MASQUERADE para cada redirecionamento.
 # ---------------------------------------------------------------------------
 pforward() {
     local dest=$1
     local prot=$2
     local pin=$3
     local pout=$4
-    iptables -t nat -A PREROUTING -p $prot --dport $pin -j DNAT --to-destination $dest:$pout
-    iptables -A FORWARD -p $prot -d $dest --dport $pout -j ACCEPT
-    iptables -t nat -A POSTROUTING -d $dest -p $prot --dport $pout -j MASQUERADE
+    iptables -t nat -A WG_PREROUTING -p $prot --dport $pin -j DNAT --to-destination $dest:$pout
+    iptables -A WG_FORWARD -p $prot -d $dest --dport $pout -j ACCEPT
+    iptables -t nat -A WG_POSTROUTING -d $dest -p $prot --dport $pout -j MASQUERADE
 }
 
 # ===========================================================================
 # CONFIGURAÇÃO DO SITE — editar conforme necessário
 # ===========================================================================
-
-# Exemplo: Redirecionamento da porta 8080 para a porta 80 em 192.168.3.21 
-#pforward 192.168.3.21 tcp 8080 80
+#pforward 192.168.10.2 tcp 82 80
 
 # Exemplo: acesso a dispositivo em outro site via VPN
 #ip route replace 192.168.3.21/32 via 10.10.10.2
@@ -46,15 +64,15 @@ pforward() {
 # --------------------------------------------------------------------------
 # Ativação do LED indicativo do Wireguard
 # --------------------------------------------------------------------------
-echo netdev > $LED/trigger
-echo $WG_IF > $LED/device_name
-echo 1 > $LED/tx
-echo 1 > $LED/rx
+echo netdev > $WGLED/trigger
+echo $WG_IF > $WGLED/device_name
+echo 1 > $WGLED/tx
+echo 1 > $WGLED/rx
 
 # ---------------------------------------------------------------------------
 # Confirmação visual no log do boot
 # ---------------------------------------------------------------------------
 echo "=== firewall.start aplicado ==="
-iptables -L FORWARD -n -v
+iptables -L WG_FORWARD -n -v
 echo "=== NAT ==="
-iptables -t nat -L -n -v
+iptables -t nat -L WG_POSTROUTING -n -v

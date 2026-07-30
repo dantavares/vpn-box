@@ -1,0 +1,1 @@
+Edite estes arquivos para configurar a conexão VPN. Entenda que qualquer erro nestes arquivos, fará com que sua conexão VPN não aconteça ou fique instável. Procure editar com cuidado e mantenha sempre o backup no repositório original.
