@@ -5,6 +5,12 @@
 Solução de VPN mesh de baixo custo para interligar redes remotas atrás de CGNAT,
 usando Alpine Linux em modo diskless em hardware ARM de baixo consumo.
 
+- VPN por Wireguard, simples, funcional, rápido e leve
+- Configurações extras permitem também:
+  1. Ser um AP Wifi
+  2. Ser um Adaptador Wifi
+  3. Ser um Repetidor Wifi
+
 ### Hardware recomendado
 
 | Dispositivo | CPU | RAM | Cartão |
